@@ -129,8 +129,9 @@ Where other instructions go:
 
 ## Part 3 — Hands-on: the report on the practice data
 
-1. Open the cloned folder in VS Code and start Claude Code in it. Put the practice run in
-   `input_data/`.
+1. Open the cloned folder in VS Code and start Claude Code in it. Download the practice run's
+   tables from the server into `input_data/`, and save there the sample key
+   (`sample_table.tsv`) you received by email.
 2. *"Explain what this folder does and how the data go from input_data/ to the figures. Don't
    change anything."*
 3. *"Render the report."* Claude runs `quarto render template/magmap_eda.qmd`; the result is

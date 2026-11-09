@@ -44,7 +44,8 @@ template/
 ```
 
 **There are no data in the repo.** `input_data/` and `output/` are in `.gitignore`. The data
-are unpublished, so keep them out of any commit.
+are unpublished, so keep them out of any commit. For the workshop, download the run's tables
+from the server; the sample key (`sample_table.tsv`) comes by email.
 
 ## Running the report on your own run
 
