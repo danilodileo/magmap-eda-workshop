@@ -1,0 +1,519 @@
+---
+title: "Exploratory analysis: magmap run"
+author: "your.name@lnu.se"
+date: today
+format:
+  html:
+    code-fold: true
+    toc: true
+    embed-resources: true
+    fig-width: 10
+execute:
+  warning: false
+  message: false
+bibliography: ../output/grateful-refs.bib
+---
+
+```{r}
+#| label: libraries
+#| include: false
+library(tidyverse)
+library(duckplyr)
+library(vegan)
+library(knitr)
+library(grateful)
+source("magmap_helpers.R")
+theme_set(theme_bw())
+```
+
+```{r}
+#| label: constants
+# Column of input_data/sample_table.tsv that groups the samples; facets appear only with more than one group
+GROUP    <- "filter_fraction"
+# Top features listed in the tables and shown in the figures
+TOP_N    <- 50
+TOP_PLOT <- 10
+DATA     <- "../input_data"
+# Filter fractions (values of filter_fraction in sample_table.tsv) kept in the analysis
+FRACTION <- "3-0.2 µm"
+# FALSE skips KOfamScan/eggNOG-mapper: the KOfamScan file in input_data/ is from another assembly
+USE_KO   <- FALSE
+```
+
+```{r}
+#| label: read-data
+sample_table <- read_tsv(file.path(DATA, "sample_table.tsv"), col_types = cols(sample = col_character())) %>%
+  filter(filter_fraction %in% FRACTION)
+has_date <- "date" %in% names(sample_table)
+
+# The run also holds samples from other projects and fractions; sample_table.tsv lists the ones to analyse
+counts <- read_magmap("magmap.CDS.counts", DATA) %>%
+  semi_join(as_duckdb_tibble(select(sample_table, sample)), by = "sample")
+
+genome_metadata <- read_magmap("magmap.genome_metadata", DATA) %>%
+  select(accno, gtdb_taxonomy, any_of(c("checkm_completeness", "checkm_contamination"))) %>%
+  collect()
+genome_taxonomy <- genome_metadata %>%
+  parse_gtdb() %>%
+  lowest_taxon()
+
+tbl <- counts %>%
+  left_join(genome_taxonomy %>% select(accno, all_of(GTDB_TAXRANKS)), by = "accno")
+
+samples <- counts %>%
+  distinct(sample) %>%
+  collect() %>%
+  left_join(sample_table, by = "sample")
+if (has_date) samples <- samples %>% mutate(season = season_of(date)) %>% arrange(date)
+n_samples <- nrow(samples)
+no_metadata <- samples$sample[is.na(samples[[GROUP]])]
+multi_group <- n_distinct(samples[[GROUP]]) > 1
+
+# KOfamScan gives the KO; eggNOG-mapper fills in ORFs it left without one
+orf_function <- if (USE_KO) read_kofamscan(DATA)
+if (is.null(orf_function)) orf_function <- tibble(orf = character(), ko = character())
+emapper <- if (USE_KO) read_emapper(DATA)
+if (!is.null(emapper)) {
+  orf_function <- orf_function %>%
+    full_join(emapper %>% select(orf, emapper_ko = ko, preferred_name, description), by = "orf") %>%
+    mutate(ko = coalesce(ko, emapper_ko))
+}
+has_ko <- nrow(orf_function) > 0
+has_prokka <- any(file.exists(file.path(DATA, paste0("magmap.prokka-annotations", c(".parquet", ".tsv.gz", ".tsv")))))
+```
+
+```{r}
+#| label: replicates
+# Samples of the same GROUP taken on the same date are replicates of one unit
+units <- samples %>%
+  mutate(unit = if (has_date) paste(date, .data[[GROUP]]) else sample) %>%
+  add_count(unit, name = "n_rep")
+unit_table <- units %>%
+  distinct(unit, .keep_all = TRUE) %>%
+  select(unit, n_rep, any_of(c("date", "season", GROUP)))
+if (has_date) unit_table <- arrange(unit_table, date)
+n_units <- nrow(unit_table)
+rep_counts <- count(unit_table, n_rep)
+
+# Dividing by the number of replicates turns a sum over a unit's samples into their mean.
+# `sample` then holds the unit, so the helpers average over units without changes.
+tbl_unit <- tbl %>%
+  inner_join(as_duckdb_tibble(select(units, sample, unit, n_rep)), by = "sample") %>%
+  mutate(tpm = tpm / n_rep, count = count / n_rep) %>%
+  select(-sample, -n_rep) %>%
+  rename(sample = unit)
+```
+
+# Summary
+
+# Introduction
+
+# Materials and Methods
+
+Reads were mapped to the genomes with nf-core/magmap. Counts and TPM per ORF (CDS) are from
+`magmap.CDS.counts`, taxonomy from the GTDB-Tk classification in `magmap.genome_metadata`.
+Relative abundance is TPM / 10^4^, in % of all CDS TPM in a sample.
+`r if (has_date) "Samples of the same date are replicates. TPM is first averaged over the replicates of each date; figures show these means, with ± 1 SD between replicates as error bars." else ""`
+Means, SDs and prevalences in the tables are over all `r n_units`
+`r if (has_date) "dates" else "samples"`, with absent features counted as zero.
+`r if (has_date) "SD (dates) is the variation between dates; SD (replicates) is the SD between replicates, averaged over dates. Prevalence is the share of dates where a feature has reads in at least one replicate. Seasons are meteorological: winter December–February, spring March–May, summer June–August, autumn September–November." else ""`
+`r if (has_prokka) "Gene names are from Prokka; the numeric suffix Prokka adds to repeated names within a genome (amtB_1, amtB_2) is dropped, so all copies count as one gene." else ""`
+`r if (has_ko) paste0("KOs are the best significant KOfamScan hit per ORF", if (!is.null(emapper)) ", with eggNOG-mapper's first KO for ORFs KOfamScan didn't assign" else "", ".") else ""`
+
+## R and packages
+
+This analysis was run with `r R.version$version.string`. Versions of packages used are in
+@tbl-packages.
+
+```{r}
+#| label: tbl-packages
+#| tbl-cap: Versions of R and packages used in this analysis.
+cite_packages(output = "table", pkgs = "Session", out.dir = "../output") %>%
+  kable()
+```
+
+# Results
+
+## Data overview
+
+```{r}
+#| label: overview
+per_sample <- counts %>%
+  summarise(reads = sum(count, na.rm = TRUE), orfs = n(), .by = sample) %>%
+  collect() %>%
+  left_join(units, by = "sample")
+n_mags <- nrow(genome_metadata)
+```
+
+`r n_samples` samples from `r n_units` `r if (has_date) "dates" else "units"`
+(`r paste(sprintf("%d with %d replicate%s", rep_counts$n, rep_counts$n_rep, if_else(rep_counts$n_rep > 1, "s", "")), collapse = ", ")`),
+`r n_mags` genomes. Reads counted on ORFs per sample range from
+`r format(min(per_sample$reads), big.mark = ",")` to `r format(max(per_sample$reads), big.mark = ",")`
+(@fig-depth).
+`r if (length(no_metadata)) paste0("**Samples without metadata in sample_table.tsv:** ", paste(no_metadata, collapse = ", "), ".") else "All samples are in sample_table.tsv."`
+
+```{r}
+#| label: fig-depth
+#| fig-cap: Reads counted on ORFs per sample (millions); one point per replicate. Low values flag samples to check before reading the rest.
+#| fig-height: 3.5
+#| eval: !expr has_date
+ggplot(per_sample, aes(x = date, y = reads / 1e6)) +
+  geom_point(aes(fill = season, shape = season), size = 2, stroke = 0.3) +
+  scale_fill_manual(values = SEASON_PAL, name = "Season", drop = FALSE) +
+  scale_shape_manual(values = SEASON_SHAPES, name = "Season", drop = FALSE) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b\n%Y") +
+  labs(x = NULL, y = "Reads counted (millions)")
+```
+
+## Taxonomic composition
+
+```{r}
+#| label: fig-phylum
+#| fig-cap: Phylum-level composition (% of TPM, mean of the replicates of each date), phyla above 1% of total TPM. Other is smaller classified phyla, Unassigned is genomes without a phylum.
+#| fig-height: 5
+#| eval: !expr has_date
+top_phyla <- feature_stats(tbl_unit, phylum, tpm, n_units) %>%
+  filter(sum / sum(sum) >= 0.01) %>%
+  pull(phylum) %>%
+  head(length(CB_PALETTES$tol_muted))
+phylum_pal <- assign_palette(top_phyla, palette = "tol_muted")
+
+p <- composition_data(tbl_unit, phylum, tpm, top_phyla) %>%
+  rename(unit = sample) %>%
+  left_join(unit_table, by = "unit") %>%
+  ggplot(aes(x = date, y = value / 1e4, fill = .display)) +
+  # Dates are at least 7 days apart, so 6-day bars never overlap
+  geom_col(width = 6) +
+  scale_fill_manual(values = phylum_pal, name = "Phylum") +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b\n%Y", expand = expansion(mult = 0.01)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "% of TPM")
+if (multi_group) p + facet_wrap(~ .data[[GROUP]], ncol = 1) else p
+```
+
+## NMDS
+
+NMDS is rank-based, so no transformation: Bray-Curtis dissimilarity on family-level TPM,
+unclassified ORFs excluded. The ordination uses every replicate, so their spread can be
+compared with the distance between dates.
+
+```{r}
+#| label: fig-nmds
+#| fig-cap: NMDS of family-level TPM (Bray-Curtis), all samples. Small points are replicates, large symbols the mean position of each date's replicates; the grey line joins the dates in time order.
+#| fig-height: 6
+#| eval: !expr has_date
+family_wide <- tbl %>%
+  filter(!is.na(family)) %>%
+  summarise(tpm = sum(tpm, na.rm = TRUE), .by = c(sample, family)) %>%
+  collect() %>%
+  pivot_wider(names_from = family, values_from = tpm, values_fill = 0) %>%
+  column_to_rownames("sample")
+
+bray <- vegdist(family_wide, "bray")
+set.seed(1)
+ord <- metaMDS(bray, trace = 0)
+
+# Dissimilarity between replicates of one date vs between dates
+bray_m <- as.matrix(bray)
+unit_of <- units$unit[match(rownames(bray_m), units$sample)]
+same_unit <- outer(unit_of, unit_of, "==")
+pairs <- lower.tri(bray_m)
+bray_within  <- median(bray_m[pairs & same_unit])
+bray_between <- median(bray_m[pairs & !same_unit])
+
+nmds <- as.data.frame(ord$points) %>%
+  rownames_to_column("sample") %>%
+  left_join(units, by = "sample")
+centroids <- nmds %>%
+  summarise(MDS1 = mean(MDS1), MDS2 = mean(MDS2), .by = c(unit, date, season)) %>%
+  arrange(date)
+
+ggplot(nmds, aes(x = MDS1, y = MDS2)) +
+  geom_path(data = centroids, colour = "grey75", linewidth = 0.3) +
+  geom_point(aes(colour = season), size = 0.9, alpha = 0.6) +
+  geom_point(data = centroids, aes(fill = season, shape = season), size = 3, stroke = 0.3) +
+  scale_colour_manual(values = SEASON_PAL, guide = "none") +
+  scale_fill_manual(values = SEASON_PAL, name = "Season", drop = FALSE) +
+  scale_shape_manual(values = SEASON_SHAPES, name = "Season", drop = FALSE) +
+  coord_equal() +
+  labs(title = sprintf("NMDS, stress = %.3f", ord$stress))
+```
+
+`r if (has_date) sprintf("Median Bray-Curtis dissimilarity is %.2f between replicates of the same date and %.2f between dates.", bray_within, bray_between) else ""`
+
+## Top MAGs
+
+```{r}
+#| label: top-mags
+mag_stats <- feature_stats(tbl_unit, accno, tpm, n_units) %>%
+  left_join(genome_taxonomy, by = "accno") %>%
+  arrange(rank) %>%
+  mutate(cumulative = cumsum(mean), label = sprintf("%s (%s)", lowest_taxon, accno))
+mag_stats <- mag_stats %>%
+  left_join(replicate_sd(tbl, accno, tpm, head(mag_stats$accno, TOP_N), units), by = "accno") %>%
+  arrange(rank)
+top_mags <- head(mag_stats, TOP_PLOT) %>% select(accno, label)
+```
+
+The top `r min(TOP_N, nrow(mag_stats))` of `r nrow(mag_stats)` MAGs account for
+`r round(mag_stats$cumulative[min(TOP_N, nrow(mag_stats))] / 1e4, 1)`% of the mean TPM, the
+top `r nrow(top_mags)` for `r round(mag_stats$cumulative[nrow(top_mags)] / 1e4, 1)`%
+(@tbl-top-mags).
+`r if (has_date) "One panel per MAG, each with its own y axis, shows their dynamics (@fig-top-mags-lines)."`
+
+```{r}
+#| label: tbl-top-mags
+#| tbl-cap: Top MAGs by mean relative abundance (% of TPM) over all dates, replicates averaged first. SD (dates) is the variation between dates, SD (rep.) the replicate SD averaged over dates. Completeness and contamination from CheckM.
+mag_stats %>%
+  head(TOP_N) %>%
+  transmute(
+    Rank = rank, MAG = accno, Phylum = phylum, Family = family, Taxon = lowest_taxon,
+    `Compl. %` = if ("checkm_completeness" %in% names(.)) checkm_completeness else NA,
+    `Contam. %` = if ("checkm_contamination" %in% names(.)) checkm_contamination else NA,
+    `Mean %` = mean / 1e4, `SD (dates) %` = sd / 1e4, `SD (rep.) %` = rep_sd / 1e4,
+    `Max %` = max / 1e4, `Prevalence %` = 100 * prevalence, `Cumulative %` = cumulative / 1e4
+  ) %>%
+  kable(digits = 2)
+```
+
+```{r}
+#| label: fig-top-mags-lines
+#| fig-cap: Relative abundance of the top MAGs over time (% of TPM, mean of the replicates of each date; error bars ± 1 SD between replicates; each panel has its own y axis).
+#| fig-height: 9
+#| eval: !expr has_date
+feature_by_sample(tbl, accno, tpm, top_mags$accno, units$sample) %>%
+  replicate_summary(units) %>%
+  left_join(top_mags, by = "accno") %>%
+  left_join(unit_table, by = "unit") %>%
+  mutate(label = factor(label, levels = top_mags$label)) %>%
+  plot_time_lines()
+```
+
+## Top genes
+
+An ORF's abundance mixes how abundant its organism is with how much the gene is expressed;
+the same ranking summed per gene name follows in the next section.
+
+```{r}
+#| label: top-genes
+gene_stats <- feature_stats(tbl_unit, orf, tpm, n_units, n = TOP_N)
+gene_stats <- gene_stats %>%
+  left_join(counts %>% filter(orf %in% !!gene_stats$orf) %>% distinct(orf, accno) %>% collect(), by = "orf") %>%
+  left_join(genome_taxonomy %>% select(accno, lowest_taxon), by = "accno") %>%
+  left_join(orf_function, by = "orf") %>%
+  left_join(replicate_sd(tbl, orf, tpm, gene_stats$orf, units), by = "orf")
+if (has_prokka) {
+  gene_stats <- gene_stats %>%
+    left_join(
+      read_magmap("magmap.prokka-annotations", DATA) %>%
+        filter(orf %in% !!gene_stats$orf) %>%
+        select(orf, gene, product) %>%
+        collect() %>%
+        mutate(gene = na_if(gene, "")),
+      by = "orf"
+    )
+}
+gene_stats <- gene_stats %>%
+  mutate(
+    gene_name = coalesce(!!!syms(intersect(c("preferred_name", "gene", "ko"), names(.))), "unannotated"),
+    gene_function = coalesce(!!!syms(intersect(c("ko_definition", "description", "product"), names(.))), "")
+  ) %>%
+  arrange(rank) %>%
+  mutate(label = sprintf("%s | %s (%s)", gene_name, lowest_taxon, orf))
+top_genes <- head(gene_stats, TOP_PLOT) %>% select(orf, label)
+```
+
+```{r}
+#| label: tbl-top-genes
+#| tbl-cap: Top ORFs by mean relative abundance (% of TPM) over all dates, replicates averaged first. SD (dates) is the variation between dates, SD (rep.) the replicate SD averaged over dates. Gene name and product from Prokka; KO from KOfamScan when switched on.
+gene_stats %>%
+  transmute(
+    Rank = rank, ORF = orf, MAG = accno, Taxon = lowest_taxon, Gene = gene_name,
+    KO = if ("ko" %in% names(.)) ko else NA, Function = gene_function,
+    `Mean %` = mean / 1e4, `SD (dates) %` = sd / 1e4, `SD (rep.) %` = rep_sd / 1e4,
+    `Max %` = max / 1e4, `Prevalence %` = 100 * prevalence
+  ) %>%
+  kable(digits = 3)
+```
+
+```{r}
+#| label: fig-top-genes-lines
+#| fig-cap: Relative abundance of the top ORFs over time (% of TPM, mean of the replicates of each date; error bars ± 1 SD between replicates), labelled gene | taxon (ORF). Each panel has its own y axis.
+#| fig-height: 9
+#| eval: !expr has_date
+feature_by_sample(tbl, orf, tpm, top_genes$orf, units$sample) %>%
+  replicate_summary(units) %>%
+  left_join(top_genes, by = "orf") %>%
+  left_join(unit_table, by = "unit") %>%
+  mutate(label = factor(label, levels = top_genes$label)) %>%
+  plot_time_lines()
+```
+
+## Top functions (Prokka gene names)
+
+```{r}
+#| label: top-functions
+#| eval: !expr has_prokka
+prokka_genes <- read_magmap("magmap.prokka-annotations", DATA) %>%
+  filter(gene != "") %>%
+  select(orf, gene, product)
+
+# One query over the large Prokka table; the rest is done on this small result
+gene_raw <- counts %>%
+  inner_join(prokka_genes, by = "orf") %>%
+  summarise(tpm = sum(tpm, na.rm = TRUE), .by = c(gene, product, sample)) %>%
+  collect() %>%
+  mutate(gene_raw = gene, gene = sub("_[0-9]+$", "", gene))
+
+gene_by_sample <- gene_raw %>% summarise(tpm = sum(tpm), .by = c(gene, sample))
+# Most abundant product per gene name, as its description
+gene_products <- gene_raw %>%
+  summarise(tpm = sum(tpm), .by = c(gene, product)) %>%
+  slice_max(tpm, n = 1, by = gene, with_ties = FALSE) %>%
+  select(gene, product)
+
+gene_unit <- gene_by_sample %>%
+  inner_join(select(units, sample, unit, n_rep), by = "sample") %>%
+  transmute(gene, sample = unit, tpm = tpm / n_rep)
+
+function_stats <- feature_stats(gene_unit, gene, tpm, n_units) %>%
+  left_join(gene_products, by = "gene")
+function_stats <- function_stats %>%
+  left_join(replicate_sd(gene_by_sample, gene, tpm, head(function_stats$gene, TOP_N), units), by = "gene") %>%
+  arrange(rank)
+function_share <- sum(function_stats$sum) / sum(mag_stats$sum)
+top_functions <- head(function_stats, TOP_PLOT) %>%
+  mutate(label = sprintf("%s: %s", gene, str_trunc(coalesce(product, ""), 45))) %>%
+  select(gene, label)
+```
+
+`r if (has_prokka) sprintf("%.1f%% of the TPM is in ORFs with a Prokka gene name; this section describes only that part. Summed over all ORFs with the same name, a gene's abundance reflects the function more than any single organism (@tbl-top-functions). The line plots show when the top functions are expressed (@fig-top-functions-lines); splitting each by genus shows whether one lineage or many express it (@fig-top-functions-contribution).", 100 * function_share) else "No Prokka annotations in input_data/, so this section is skipped."`
+
+```{r}
+#| label: tbl-top-functions
+#| tbl-cap: Top gene names by mean relative abundance (% of TPM, all ORFs with the name summed) over all dates, replicates averaged first. SD (dates) is the variation between dates, SD (rep.) the replicate SD averaged over dates. Product is the most abundant Prokka product for the name.
+#| eval: !expr has_prokka
+function_stats %>%
+  head(TOP_N) %>%
+  transmute(
+    Rank = rank, Gene = gene, Product = product,
+    `Mean %` = mean / 1e4, `SD (dates) %` = sd / 1e4, `SD (rep.) %` = rep_sd / 1e4,
+    `Max %` = max / 1e4, `Prevalence %` = 100 * prevalence
+  ) %>%
+  kable(digits = 3)
+```
+
+```{r}
+#| label: fig-top-functions-lines
+#| fig-cap: Relative abundance of the top gene names over time (% of TPM, all ORFs with the name summed, mean of the replicates of each date; error bars ± 1 SD between replicates). Each panel has its own y axis.
+#| fig-height: 9
+#| eval: !expr has_prokka && has_date
+feature_by_sample(gene_by_sample, gene, tpm, top_functions$gene, units$sample) %>%
+  replicate_summary(units) %>%
+  left_join(top_functions, by = "gene") %>%
+  left_join(unit_table, by = "unit") %>%
+  mutate(label = factor(label, levels = top_functions$label)) %>%
+  plot_time_lines()
+```
+
+```{r}
+#| label: fig-top-functions-contribution
+#| fig-cap: Mean relative abundance (% of TPM, over all dates, replicates averaged first) of the top gene names, split by the genus of the MAG expressing them (7 largest). Other is the remaining genera, Unassigned is MAGs without a genus.
+#| fig-height: 5
+#| eval: !expr has_prokka
+top_raw <- distinct(filter(gene_raw, gene %in% top_functions$gene), gene = gene_raw)
+function_genus <- tbl_unit %>%
+  inner_join(prokka_genes %>% semi_join(as_duckdb_tibble(top_raw), by = "gene"), by = "orf") %>%
+  summarise(tpm = sum(tpm, na.rm = TRUE), .by = c(gene, genus)) %>%
+  collect() %>%
+  mutate(gene = sub("_[0-9]+$", "", gene))
+top_function_genera <- function_genus %>%
+  filter(!is.na(genus)) %>%
+  summarise(tpm = sum(tpm), .by = genus) %>%
+  slice_max(tpm, n = 7, with_ties = FALSE) %>%
+  pull(genus)
+function_genus_pal <- assign_palette(top_function_genera, palette = "okabe_ito")
+
+contribution_data(function_genus, gene, genus, tpm, top_functions$gene, top_function_genera, n_units) %>%
+  left_join(top_functions, by = "gene") %>%
+  mutate(label = factor(label, levels = rev(top_functions$label))) %>%
+  ggplot(aes(x = value / 1e4, y = label, fill = .display)) +
+  geom_col() +
+  scale_fill_manual(values = function_genus_pal, name = "Genus") +
+  labs(x = "Mean % of TPM", y = NULL)
+```
+
+## Top functions (KOs)
+
+```{r}
+#| label: top-kos
+#| eval: !expr has_ko
+tbl_ko <- tbl %>%
+  inner_join(orf_function %>% filter(!is.na(ko)) %>% select(orf, ko), by = "orf")
+tbl_ko_unit <- tbl_unit %>%
+  inner_join(orf_function %>% filter(!is.na(ko)) %>% select(orf, ko), by = "orf")
+
+ko_definitions <- orf_function %>%
+  filter(!is.na(ko)) %>%
+  transmute(ko, definition = coalesce(!!!syms(intersect(c("ko_definition", "description"), names(.))))) %>%
+  distinct(ko, .keep_all = TRUE)
+
+ko_stats <- feature_stats(tbl_ko_unit, ko, tpm, n_units) %>%
+  left_join(ko_definitions, by = "ko")
+ko_stats <- ko_stats %>%
+  left_join(replicate_sd(tbl_ko, ko, tpm, head(ko_stats$ko, TOP_N), units), by = "ko") %>%
+  arrange(rank)
+ko_share <- sum(ko_stats$sum) / sum(mag_stats$sum)
+top_kos <- head(ko_stats, TOP_PLOT) %>%
+  mutate(label = sprintf("%s: %s", ko, str_trunc(coalesce(definition, ""), 45)))
+```
+
+`r if (has_ko) sprintf("%.1f%% of the TPM is in ORFs with a KO; this section describes only that part. The line plots show when the top KOs are expressed (@fig-top-kos-lines); splitting each by genus shows whether one lineage or many express it (@fig-top-kos-contribution).", 100 * ko_share) else if (USE_KO) "No KOfamScan or eggNOG-mapper table in input_data/, so this section is skipped." else "KO annotations are switched off (USE_KO in the constants chunk), so this section is skipped."`
+
+```{r}
+#| label: tbl-top-kos
+#| tbl-cap: Top KOs by mean relative abundance (% of TPM, all ORFs with the KO summed) over all dates, replicates averaged first. SD (dates) is the variation between dates, SD (rep.) the replicate SD averaged over dates.
+#| eval: !expr has_ko
+ko_stats %>%
+  head(TOP_N) %>%
+  transmute(Rank = rank, KO = ko, Definition = definition, `Mean %` = mean / 1e4,
+            `SD (dates) %` = sd / 1e4, `SD (rep.) %` = rep_sd / 1e4,
+            `Max %` = max / 1e4, `Prevalence %` = 100 * prevalence) %>%
+  kable(digits = 3)
+```
+
+```{r}
+#| label: fig-top-kos-lines
+#| fig-cap: Relative abundance of the top KOs over time (% of TPM, all ORFs with the KO summed, mean of the replicates of each date; error bars ± 1 SD between replicates). Each panel has its own y axis.
+#| fig-height: 9
+#| eval: !expr has_ko && has_date
+feature_by_sample(tbl_ko, ko, tpm, top_kos$ko, units$sample) %>%
+  replicate_summary(units) %>%
+  left_join(top_kos %>% select(ko, label), by = "ko") %>%
+  left_join(unit_table, by = "unit") %>%
+  mutate(label = factor(label, levels = top_kos$label)) %>%
+  plot_time_lines()
+```
+
+```{r}
+#| label: fig-top-kos-contribution
+#| fig-cap: Mean relative abundance (% of TPM, over all dates, replicates averaged first) of the top KOs, split by the genus of the MAG expressing them (7 largest). Other is the remaining genera, Unassigned is MAGs without a genus.
+#| fig-height: 5
+#| eval: !expr has_ko
+top_genera <- feature_stats(tbl_ko_unit %>% filter(ko %in% !!top_kos$ko), genus, tpm, n_units, n = 7)$genus
+genus_pal <- assign_palette(top_genera, palette = "okabe_ito")
+
+contribution_data(tbl_ko_unit, ko, genus, tpm, top_kos$ko, top_genera, n_units) %>%
+  left_join(top_kos %>% select(ko, label), by = "ko") %>%
+  mutate(label = factor(label, levels = rev(top_kos$label))) %>%
+  ggplot(aes(x = value / 1e4, y = label, fill = .display)) +
+  geom_col() +
+  scale_fill_manual(values = genus_pal, name = "Genus") +
+  labs(x = "Mean % of TPM", y = NULL)
+```
+
+{{< include _pn_genes.qmd >}}
+
+# Discussion
+
+# References

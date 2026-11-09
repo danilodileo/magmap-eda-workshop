@@ -1,0 +1,165 @@
+## Phosphorus and nitrogen marker genes
+
+```{r}
+#| label: marker-setup
+#| eval: !expr has_prokka
+MARKERS <- file.path(DATA, "P_N_marker_genes.tsv")
+has_markers <- file.exists(MARKERS) && has_date
+# Pho regulon: the genome's own transcripts as denominator; dates where the MAG is below this
+# share of the community TPM are left out, because the ratio is noise there
+MIN_MAG_TPM <- 500
+N_PHO_MAGS  <- 5
+```
+
+```{r}
+#| label: marker-data
+#| eval: !expr has_prokka && has_markers
+# nxrA is matched by the same Prokka names as narG, so it would count the same ORFs twice
+markers <- read_tsv(MARKERS, col_types = cols(.default = "c"), na = "NA") %>%
+  filter(priority == "core", !is.na(prokka_gene_regex), gene != "nxrA") %>%
+  mutate(order = row_number())
+
+# Regexes are matched on the distinct Prokka name/product pairs, a small table, not on every ORF
+marker_names <- markers %>%
+  select(marker = gene, prokka_gene_regex, prokka_product_regex) %>%
+  cross_join(prokka_genes %>% distinct(gene, product) %>% collect()) %>%
+  filter(str_detect(gene, prokka_gene_regex), str_detect(str_to_lower(product), prokka_product_regex)) %>%
+  distinct(gene, product, marker)
+
+marker_orfs <- prokka_genes %>%
+  inner_join(as_duckdb_tibble(marker_names), by = c("gene", "product")) %>%
+  select(orf, marker)
+
+# Replicates averaged per date, as in the rest of the report
+to_unit <- function(df, ...) {
+  df %>%
+    inner_join(select(units, sample, unit, n_rep), by = "sample") %>%
+    summarise(tpm = sum(tpm / n_rep), .by = c(..., unit)) %>%
+    left_join(select(unit_table, unit, date), by = "unit")
+}
+marker_unit <- counts %>%
+  inner_join(marker_orfs, by = "orf") %>%
+  summarise(tpm = sum(tpm, na.rm = TRUE), .by = c(accno, marker, sample)) %>%
+  collect() %>%
+  to_unit(accno, marker) %>%
+  left_join(select(markers, marker = gene, cycle, process), by = "marker")
+mag_unit <- counts %>%
+  summarise(tpm = sum(tpm, na.rm = TRUE), .by = c(accno, sample)) %>%
+  collect() %>%
+  to_unit(accno) %>%
+  rename(mag_tpm = tpm)
+
+mag_label <- genome_taxonomy %>% select(accno, lowest_taxon)
+plot_mag_lines <- function(df, pal, y) {
+  ggplot(df, aes(x = date, y = value, colour = label)) +
+    geom_line(linewidth = 0.5, na.rm = TRUE) +
+    geom_point(size = 0.7, na.rm = TRUE) +
+    facet_wrap(~ facet, ncol = 2, scales = "free_y") +
+    scale_colour_manual(values = pal, name = NULL) +
+    scale_x_date(date_breaks = "3 months", date_labels = "%b\n%Y") +
+    labs(x = NULL, y = y) +
+    guides(colour = guide_legend(ncol = 2)) +
+    theme(legend.position = "bottom", strip.text = element_text(size = 8))
+}
+```
+
+`r if (has_prokka && has_markers) "Marker genes and their Prokka names are listed in input_data/P_N_marker_genes.tsv (core genes only). An ORF counts as a marker when both its Prokka gene name and its product match the patterns in the list." else "No input_data/P_N_marker_genes.tsv, Prokka annotation or sample dates, so this section is skipped."`
+
+### Pho regulon
+
+A gene's share of its own genome's transcripts separates regulation from abundance: a
+MAG that is P-limited raises *pstS* and the alkaline phosphatases relative to the rest of its
+transcriptome, whatever its abundance (@fig-pho-mags).
+
+```{r}
+#| label: fig-pho-mags
+#| fig-cap: !expr sprintf("Pho regulon genes in the %d MAGs with the highest summed TPM of these genes, as %% of each MAG's own TPM (mean of the replicates of each date). Other MAGs is the rest of the community pooled. Dates where a MAG is below %.2f%% of the community TPM are left out. Each panel has its own y axis.", N_PHO_MAGS, MIN_MAG_TPM / 1e4)
+#| fig-height: 9
+#| eval: !expr has_prokka && has_markers
+pho_genes <- markers %>% filter(cycle == "P")
+pho <- marker_unit %>% filter(marker %in% pho_genes$gene)
+
+top_pho <- pho %>%
+  summarise(tpm = sum(tpm), .by = accno) %>%
+  slice_max(tpm, n = N_PHO_MAGS, with_ties = FALSE) %>%
+  left_join(mag_label, by = "accno") %>%
+  mutate(label = make.unique(lowest_taxon, sep = " #"))
+pho_pal <- assign_palette(top_pho$label, other = "Other MAGs")
+
+# Every top MAG × gene × date, so a date without reads is a zero, not a gap
+pho_top <- expand_grid(accno = top_pho$accno, marker = pho_genes$gene, unit = unit_table$unit) %>%
+  left_join(select(pho, accno, marker, unit, tpm), by = c("accno", "marker", "unit")) %>%
+  left_join(select(top_pho, accno, label), by = "accno")
+pho_other <- pho %>%
+  filter(!accno %in% top_pho$accno) %>%
+  summarise(tpm = sum(tpm), .by = c(marker, unit)) %>%
+  right_join(expand_grid(marker = pho_genes$gene, unit = unit_table$unit), by = c("marker", "unit")) %>%
+  mutate(accno = "other", label = "Other MAGs")
+other_tpm <- mag_unit %>%
+  filter(!accno %in% top_pho$accno) %>%
+  summarise(mag_tpm = sum(mag_tpm), .by = unit) %>%
+  mutate(accno = "other")
+
+bind_rows(pho_top, pho_other) %>%
+  left_join(bind_rows(select(mag_unit, accno, unit, mag_tpm), other_tpm), by = c("accno", "unit")) %>%
+  left_join(select(unit_table, unit, date), by = "unit") %>%
+  left_join(select(pho_genes, marker = gene, process, order), by = "marker") %>%
+  mutate(
+    value = if_else(coalesce(mag_tpm, 0) >= MIN_MAG_TPM, 100 * coalesce(tpm, 0) / mag_tpm, NA_real_),
+    facet = fct_reorder(sprintf("%s: %s", marker, sub("^[^:]*: ", "", process)), order),
+    label = factor(label, levels = names(pho_pal))
+  ) %>%
+  plot_mag_lines(pho_pal, "% of the MAG's TPM")
+```
+
+### Nitrogen cycle
+
+Each nitrogen process is carried by different organisms, so the figure shows, for each
+process, the MAG that expresses it most, with the rest of the community pooled
+(@fig-n-processes). Values are % of community TPM: they mix the abundance of the organism
+and the expression of the genes.
+
+```{r}
+#| label: fig-n-processes
+#| fig-cap: Nitrogen processes over time (% of TPM, marker genes of the process summed, mean of the replicates of each date). Coloured lines are the MAGs that express each process most (shown where they carry at least 5% of it); Other MAGs is the rest of the community. Each panel has its own y axis.
+#| fig-height: 11
+#| eval: !expr has_prokka && has_markers
+n_proc <- marker_unit %>%
+  filter(cycle == "N") %>%
+  left_join(markers %>% filter(cycle == "N") %>% summarise(order = min(order), genes = paste(gene, collapse = ", "), .by = process),
+            by = "process") %>%
+  mutate(facet = fct_reorder(sprintf("%s (%s)", process, genes), order))
+
+proc_mag <- n_proc %>% summarise(tpm = sum(tpm), .by = c(facet, accno))
+# The leading MAG of each process; colours run out at 9, so the least expressed processes lose theirs
+lead_mags <- proc_mag %>%
+  slice_max(tpm, n = 1, by = facet, with_ties = FALSE) %>%
+  summarise(tpm = max(tpm), .by = accno) %>%
+  slice_max(tpm, n = length(CB_PALETTES$tol_muted), with_ties = FALSE) %>%
+  left_join(mag_label, by = "accno") %>%
+  mutate(label = make.unique(lowest_taxon, sep = " #"))
+n_pal <- assign_palette(lead_mags$label, other = "Other MAGs")
+
+shown <- proc_mag %>%
+  mutate(share = tpm / sum(tpm), .by = facet) %>%
+  filter(accno %in% lead_mags$accno, share >= 0.05) %>%
+  select(facet, accno)
+
+# A MAG gets its own line only in the processes where it is shown
+n_lines <- n_proc %>%
+  left_join(mutate(shown, keep = TRUE), by = c("facet", "accno")) %>%
+  mutate(accno = if_else(coalesce(keep, FALSE), accno, "other")) %>%
+  summarise(tpm = sum(tpm), .by = c(facet, accno, unit))
+n_grid <- bind_rows(shown, distinct(n_proc, facet) %>% mutate(accno = "other")) %>%
+  cross_join(select(unit_table, unit, date))
+
+n_grid %>%
+  left_join(n_lines, by = c("facet", "accno", "unit")) %>%
+  left_join(select(lead_mags, accno, label), by = "accno") %>%
+  mutate(
+    value = coalesce(tpm, 0) / 1e4,
+    label = factor(coalesce(label, "Other MAGs"), levels = names(n_pal)),
+    facet = factor(facet, levels = levels(n_proc$facet))
+  ) %>%
+  plot_mag_lines(n_pal, "% of TPM")
+```

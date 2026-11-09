@@ -1,0 +1,10 @@
+# Unpublished data and results derived from them stay local
+input_data/
+output/
+
+.DS_Store
+.quarto/
+*_files/
+.Rhistory
+.RData
+.Rproj.user/
